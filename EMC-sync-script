@@ -1,0 +1,287 @@
+#!/bin/bash
+# Script to make BCV / Oracle Hotbackup 
+# created Rob de Jongh 
+#######################################
+name=`basename $0`
+set -x
+date=`/bin/date +%H\u%M-%d-%b-%Y`
+log="/var/log/${name}.${date}"
+`touch $log`
+sendmail="/usr/bin/mail" 
+user=
+group=
+devicegroup=
+databasename=
+stop_database=
+abort_database=
+rename_database=
+test_database=
+custom_database_script=
+mounts=
+volumegroups=
+emc_sync=
+mail="/usr/bin/mail"
+recipient=
+env="${1}"
+
+. /usr/local/etc/${env}.conf
+export databasename user group devicegroup stop_database abort_database rename_database test_database custom_database_script mounts volumegroups emc_sync recipient 
+array=(${mounts})
+
+######################################
+
+mail () {
+for mail in $recipient; do
+ case $1 in
+    Still_running)
+    $sendmail -s "${databasename} Still running" "${mail}" < $log
+    ;;
+    Not_stopped)
+    $sendmail -s "${databasename} Not Stopped" "${mail}" < $log
+    ;;
+    Not_in_sync)
+    $sendmail -s "${devicegroup} Not synchronised" "${mail}" < $log
+    ;;
+    Online)
+    $sendmail -s "${databasename} Online" "${mail}" < $log
+    ;;
+    Error)
+    $sendmail -s "${databasename} ---ERROR--" "${mail}" < $log
+    ;;
+    Norun)	
+    $sendmail -s "${databasename} Norun file detected" "${mail}" < $log
+    ;;
+ esac
+done
+exit $? 
+}
+
+norun () {
+orapath="/oracle/norun"
+if [ -e ${orapath}/norun.${databasename} ]; then
+ rm ${orapath}/norun.${databasename} 
+ echo "norun file ${databasename} removed" 
+ mail Norun 
+ exit 1
+fi 
+}
+
+oracheck () {
+if [[ -z ${databasename} ]] ; then
+ echo -e "No test Database\n " >> ${log}
+else 
+ $test_database
+ if [[ "$?" = "0" ]]; then
+  echo -e "$databasename Online\n" >> ${log}
+  return 0
+ else
+  echo -e "$databasename Stopped\n" >> ${log}
+  return 1
+ fi
+fi
+}
+
+set_time () {
+ echo -e "time ${0} ${date}\n" >> ${log}
+ echo -e "${env}\n" >> ${log}
+}
+
+stop_database () {
+echo -e "aborting ${databasename}\n" >> ${log}
+if [[ -z ${databasename} ]]; then
+ echo -e "No Oracle\n" >> ${log}
+else
+ $abort_database
+fi
+}
+
+check_if_stopped () {
+if [[ -z ${databasename} ]]; then
+ echo -e "No Oracle\n" >> ${log}
+else 
+ export N=0
+ while [[ $N != "20" ]]; do
+  oracheck
+  if [[ $? -gt "0" ]]; then
+   break
+  fi
+  sleep 30
+  let N=$N+1
+  done
+ if [[ $N = 20 ]] ; then
+  echo -e "Error count\n" 
+  mail Still_running
+ fi
+fi
+}
+
+umountall () {
+if [[ -z ${mounts} ]]; then 
+ echo -e "No mount points\n" >> ${log}
+else
+for e in "${array[@]}"
+do
+	revarray=( "$e" "${revarray[@]}" )
+done 
+	for i in ${!revarray[*]} ; do
+	umount ${revarray[$i]}
+	done 
+fi
+}
+
+clear_lvm () {
+if [[ -z ${volumegroups} ]]; then
+ echo -e "No Volume Group's\n" >> ${log}
+else
+ for n in ${volumegroups}; do
+  /sbin/vgchange -a n ${n}
+ done
+ for i in ${volumegroups}; do
+  /sbin/vgexport ${i}
+ done
+fi
+}
+
+clear_multipath () {
+if [ "$(cat /proc/modules | grep multipath)" ]; then
+ echo -e "Multipath found\n" >> ${log}
+ /sbin/multipath -F 
+fi
+}
+
+sync () {
+if [[ -z ${devicegroup} ]]; then
+ echo -e "Device group not set\n" >> ${log}
+ echo -e "---No Device groups---\n" >> ${log}
+ exit 1
+else 
+# Sync bcv device groups
+ case $1 in
+      establish)
+      echo -e "${devicegroup} establish\n" >> ${log}
+      for i in ${devicegroup} ; do $emc_sync -g $i est -noprompt ; done 
+      ;;
+      sync)
+      echo -e "${devicegroup} verify sync\n" >> ${log}
+      for e in ${devicegroup} ;  do $emc_sync -g $e verify ; done
+      ;;
+      split)
+      sync_rdf="/opt/emc/SYMCLI/bin/symrdf"
+      if [ "${emc_sync}" = "${sync_rdf}" ] ; then 
+       echo -e "${devicegroup} split rdf\n" >> ${log}
+       for f in ${devicegroup} ; do $emc_sync -g $f split -noprompt ; done
+      else   
+       echo -e "${devicegroup} split bcv\n" >> ${log}
+       for g in ${devicegroup} ; do $emc_sync -g $g split -consistent -noprompt ; done 
+      fi 
+      ;;
+ esac
+fi
+}
+
+check_sync () {
+echo -e "Check sync devicegroup's ${devicegroup}\n" >> ${log}
+export N=0
+deviceGroup=( ${devicegroup[@]} )
+while [[ $N != "480" ]] ; do
+ for I in ${!deviceGroup[*]}; do
+  $emc_sync -g ${deviceGroup[$I]} verify
+   if [[ $? = 0 ]] ; then
+    unset deviceGroup[$I]
+   fi
+ done
+ if [[ ${#deviceGroup[@]} = 0 ]] ; then
+  break
+ fi
+ sleep 60
+ let N=$N+1
+done
+if [[ $N = 480 ]]; then
+  mail Error
+fi
+echo -e "Synchronise DeviceGroups ${devicegroup} ready\n" >> ${log}
+}
+
+scan_multipath () {
+echo -e "scan with multipath for new devices\n" >> ${log}
+if [ "$(cat /proc/modules | grep multipath)" ]; then
+  /sbin/multipath
+fi
+}
+
+mountall () {
+if [[ -z ${volumegroups} ]]; then
+ echo -e "No Volume Group's\n" >> ${log}
+else
+  /sbin/vgscan > /dev/null 2>&1
+  for n in ${volumegroups}; do
+   /sbin/vgimport $n
+  done
+  for i in ${volumegroups}; do
+   /sbin/vgchange -a y ${i}
+  done
+ if [[ -z ${mounts} ]]; then  
+  echo -e "No mounts points given\n" >> ${log}
+ else 
+ for i in ${mounts}; do
+  mount ${i}
+ done
+ for i in ${mounts} ; do 
+  /bin/chown -R ${user}:${group} $i
+ done 
+ fi 
+fi
+}
+
+rename_database () {
+if [[ -z ${databasename} ]];then
+ echo -e "No Oracle\n" >> ${log}
+else 
+ echo -e "Rename ${databasename}\n" >> ${log}
+ $rename_database 
+fi
+}
+
+custom_database_script () {
+if [[ -z ${custom_database_script} ]];then
+ echo -e "No custom database scripts\n" >> ${log}
+else
+ echo -e "Custom database script ${databasename}\n" >> ${log}
+ $custom_database_script
+fi
+}
+
+check_if_database_is_online () {
+if [[ -z ${databasename} ]] ; then
+ echo -e "No Oracle sid\n" 
+ mail Sync compleet
+else
+ echo -e "SQLplus check ${databasename}\n" >> ${log}
+ oracheck
+ if [[ $? = "0" ]] ;then
+  echo -e "${databasename} Online ${date}\n" >> ${log}
+  mail Online
+ else
+  echo -e "${databasename} Offline ${date}\n" >> ${log}
+  mail Error
+ fi
+fi 
+}
+
+norun
+set_time
+stop_database
+check_if_stopped 
+umountall
+clear_lvm
+clear_multipath
+sync establish
+check_sync 
+sync split
+scan_multipath
+mountall 
+rename_database
+custom_database_script
+set_time
+clear_multipath
+check_if_database_is_online
